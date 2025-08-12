@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
 import uuid
+import json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, field_validator, UUID4
@@ -16,7 +17,7 @@ from MDI import router as mdi_router
 from models import TokenRequest, TokenResponse, Country, State, Address, FileInfo, DosespotInfo, PartnerInfo, Metafield, PatientAddress, PatientRequest, PatientResponse, CaseStatus, ClinicianPhoto, Clinician, CaseAssignment, PartnerCustomization, PartnerAddress, Tag, CasePrescription, CaseQuestion, CaseRequest, CaseResponse, QuestionnaireMatchRequest, QuestionnaireMatchResponse, ChatMessage, QuestionnaireMatchResult, ChatSession, ChatRequest, ChatResponse, MultipleChoiceQuestion, BooleanQuestion, SingleChoiceQuestion, IntegerQuestion, StringQuestion, TextQuestion, InformationalQuestion
 
 from database import get_db_connection, create_session_in_db, update_session_questionnaire, mark_questionnaire_complete, save_questionnaire_answer, get_questionnaire_answers, add_chat_message, get_session_from_db, get_chat_messages_from_db, generate_session_id, get_or_create_session, get_unanswered_questions, update_questionnaire_answer, get_questionnaire_answers_for_session
-from MDI import match_questionnaire_to_query, get_questionnaire_questions
+from MDI import match_questionnaire_to_query, get_questionnaire_questions, get_simplified_questionnaires, get_simplified_questionnaire
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,391 +35,6 @@ app.add_middleware(
 
 app.include_router(mdi_router)
 
-async def process_user_answer(question, user_answer):
-    """
-    Process and validate user answer based on question type.
-    Returns standardized answer format for database storage.
-    """
-    question_type = question.get("type", "")
-    options = question.get("options", [])
-    
-    # Clean the user answer
-    cleaned_answer = user_answer.strip().lower() if user_answer else ""
-    
-    try:
-        if question_type == "boolean":
-            # Convert Yes/No to 1/0
-            if cleaned_answer in ["yes", "true", "1", "y", "yeah", "yep", "sure", "ok", "okay"]:
-                return "1"
-            elif cleaned_answer in ["no", "false", "0", "n", "nope", "nah", "not really"]:
-                return "0"
-            else:
-                # Try to extract yes/no from longer responses
-                if any(word in cleaned_answer for word in ["yes", "true", "affirmative", "correct", "right", "that's right", "correct"]):
-                    return "1"
-                elif any(word in cleaned_answer for word in ["no", "false", "negative", "incorrect", "wrong", "that's wrong", "not"]):
-                    return "0"
-                else:
-                    # For unclear responses, try to be smart about context
-                    if "don't" in cleaned_answer or "do not" in cleaned_answer or "never" in cleaned_answer:
-                        return "0"
-                    elif "do" in cleaned_answer and "not" not in cleaned_answer:
-                        return "1"
-                    else:
-                        raise ValueError(f"Invalid boolean answer: {user_answer}. Expected Yes/No or 1/0.")
-        
-        elif question_type == "multiple_option":
-            # For multiple choice, handle comma-separated or array of selections
-            if isinstance(user_answer, list):
-                # If it's already a list, validate each option
-                selected_options = user_answer
-            elif "," in cleaned_answer:
-                # Handle comma-separated values
-                selected_options = [opt.strip() for opt in cleaned_answer.split(",")]
-            else:
-                # Single selection
-                selected_options = [cleaned_answer]
-            
-            # Validate all selected options
-            option_texts = [opt.get("option", "").lower() for opt in options]
-            valid_selections = []
-            
-            for selection in selected_options:
-                if selection in option_texts:
-                    valid_selections.append(selection)
-                else:
-                    # Try to find partial matches
-                    for option in option_texts:
-                        if option in selection or selection in option:
-                            valid_selections.append(option)
-                            break
-                        # Handle common variations
-                        if option.replace(" ", "") == selection.replace(" ", ""):
-                            valid_selections.append(option)
-                            break
-            
-            if not valid_selections:
-                raise ValueError(f"Invalid options: {user_answer}. Available options: {[opt.get('option') for opt in options]}")
-            
-            # Return as comma-separated string for database storage
-            return ",".join(valid_selections)
-        
-        elif question_type == "single_option":
-            # For single choice, same logic as multiple choice
-            option_texts = [opt.get("option", "").lower() for opt in options]
-            if cleaned_answer in option_texts:
-                return cleaned_answer
-            else:
-                # Try to find partial matches
-                for option in option_texts:
-                    if option in cleaned_answer or cleaned_answer in option:
-                        return option
-                    # Handle common variations
-                    if option.replace(" ", "") == cleaned_answer.replace(" ", ""):
-                        return option
-                raise ValueError(f"Invalid option: {user_answer}. Available options: {[opt.get('option') for opt in options]}")
-        
-        elif question_type == "integer":
-            # Validate and return integer
-            try:
-                # Extract numbers from text (e.g., "3 days" -> "3")
-                import re
-                numbers = re.findall(r'\d+', cleaned_answer)
-                if numbers:
-                    num = int(numbers[0])
-                    if num < 0:
-                        raise ValueError("Number must be non-negative")
-                    if num > 999:  # Reasonable upper limit
-                        raise ValueError("Number seems too high")
-                    return str(num)
-                else:
-                    raise ValueError(f"No number found in: {user_answer}")
-            except ValueError as e:
-                if "No number found" in str(e):
-                    raise e
-                raise ValueError(f"Invalid integer: {user_answer}. Please enter a valid number.")
-        
-        elif question_type in ["string", "text"]:
-            # For text inputs, return as-is but validate length
-            if len(cleaned_answer) < 1:
-                raise ValueError("Answer cannot be empty")
-            if len(cleaned_answer) > 1000:  # Reasonable limit
-                raise ValueError("Answer too long (max 1000 characters)")
-            return cleaned_answer
-        
-        elif question_type == "informational":
-            # For informational questions, user typically just continues
-            if cleaned_answer in ["continue", "ok", "okay", "yes", "got it", "understood", "next"]:
-                return "acknowledged"
-            else:
-                return "acknowledged"  # Default to acknowledged for any response
-        
-        else:
-            # Unknown type, return as-is
-            return cleaned_answer
-            
-    except Exception as e:
-        print(f"Error processing answer for question {question.get('title', 'Unknown')}: {str(e)}")
-        # Return original answer if processing fails
-        return user_answer
-
-async def ask_question(question, session_id):
-    """
-    Use GPT-4o-mini to format a question object into a user-friendly string to be asked.
-    """
-    title = question.get('title', '')
-    description = question.get('description', '')
-    label = question.get('label', '')
-    question_type = question.get('type', '')
-    options = question.get('options', [])
-    
-    # Build the prompt for GPT
-    prompt = f"""
-You are a medical assistant on an asynchronous healthcare platform. You need to ask this specific question to gather more information:
-
-Question Title: {title}
-Description: {description}
-Label: {label}
-Type: {question_type}
-
-"""
-    
-    if options:
-        prompt += "Options:\n"
-        for option in options:
-            prompt += f"- {option.get('option', '')}\n"
-    
-    prompt += f"""
-Please format this as a natural, conversational question that a medical assistant would ask a patient in an asynchronous healthcare setting. 
-
-Make it friendly, professional, and easy to understand. Format the response as a single, natural question:"""
-    
-    try:
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            print("OPENAI_API_KEY not set in environment variables")
-            return title  # Fallback to just the title
-        
-        client = openai.OpenAI(api_key=openai_api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a professional medical assistant on an asynchronous healthcare platform. You ask questions to gather information needed for patient treatment. Be conversational, professional, and clear."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=300,
-            temperature=0.3
-        )
-        
-        formatted_question = response.choices[0].message.content.strip()
-        
-        # Return structured data based on question type
-        if question_type == "multiple_option" and options:
-            return MultipleChoiceQuestion(
-                question=formatted_question,
-                options=[opt.get('option', '') for opt in options]
-            )
-        elif question_type == "boolean":
-            return BooleanQuestion(
-                question=formatted_question,
-                options=["Yes", "No"]
-            )
-        elif question_type == "single_option" and options:
-            return SingleChoiceQuestion(
-                question=formatted_question,
-                options=[opt.get('option', '') for opt in options]
-            )
-        elif question_type == "integer":
-            return IntegerQuestion(
-                question=formatted_question,
-                placeholder=question.get('placeholder')
-            )
-        elif question_type == "string":
-            return StringQuestion(
-                question=formatted_question,
-                placeholder=question.get('placeholder')
-            )
-        elif question_type == "text":
-            return TextQuestion(
-                question=formatted_question,
-                placeholder=question.get('placeholder')
-            )
-        elif question_type == "informational":
-            return InformationalQuestion(
-                question=formatted_question,
-                description=question.get('description')
-            )
-        else:
-            return formatted_question
-        
-    except Exception as e:
-        print(f"Error formatting question with GPT: {str(e)}")
-        # Fallback to basic formatting
-        return title
-
-async def get_next_question_with_rules(questions, answers, session_id):
-    """
-    Get the next question based on questionnaire rules and previous answers.
-    """
-    # Sort questions by order
-    sorted_questions = sorted(questions, key=lambda q: q.get("order", 9999))
-    
-    for question in sorted_questions:
-        question_id = question["partner_questionnaire_question_id"]
-        
-        # Skip if already answered
-        if question_id in answers:
-            continue
-            
-        # Check if question should be visible based on rules
-        if not question.get("is_visible", True):
-            continue
-            
-        # Check rules to see if this question should be shown
-        rules = question.get("rules", [])
-        if not rules:
-            # No rules, show the question
-            return question
-            
-        # Check if all rules are satisfied
-        should_show = True
-        for rule in rules:
-            rule_type = rule.get("type", "and")
-            requirements = rule.get("requirements", [])
-            
-            if rule_type == "and":
-                # All requirements must be met
-                for req in requirements:
-                    if not await check_requirement(req, answers, session_id):
-                        should_show = False
-                        break
-                if not should_show:
-                    break
-            elif rule_type == "or":
-                # At least one requirement must be met
-                req_met = False
-                for req in requirements:
-                    if await check_requirement(req, answers, session_id):
-                        req_met = True
-                        break
-                if not req_met:
-                    should_show = False
-                    break
-        
-        if should_show:
-            return question
-    
-    return None
-
-async def check_requirement(requirement, answers, session_id):
-    """
-    Check if a specific requirement is met based on previous answers.
-    """
-    based_on = requirement.get("based_on")
-    required_question_id = requirement.get("required_question_id")
-    required_answer = requirement.get("required_answer")
-    conditional_answer = requirement.get("conditional_answer")
-    
-    if based_on == "question" and required_question_id:
-        # Check if the required question was answered with the required answer
-        if required_question_id in answers:
-            user_answer = answers[required_question_id].get("answer", "")
-            
-            # Handle different answer formats
-            if required_answer == "0" or required_answer == "1":
-                # Boolean questions (0 = No, 1 = Yes)
-                if required_answer == "0" and user_answer.lower() in ["no", "false", "0"]:
-                    return True
-                elif required_answer == "1" and user_answer.lower() in ["yes", "true", "1"]:
-                    return True
-            else:
-                # Text-based answers (exact match)
-                if user_answer.lower() == required_answer.lower():
-                    return True
-    
-    return False
-
-async def handle_chat_logic(session: ChatSession, request: ChatRequest, session_created: bool):
-    """
-    Helper function to handle the chat logic after questionnaire has been assigned.
-    """
-    # Get the next question
-    questions = await get_questionnaire_questions(session.questionnaire_id)
-    answers = await get_questionnaire_answers_for_session(session.session_id)
-    
-    # Find next unanswered question using rules
-    next_question = await get_next_question_with_rules(questions, answers, session.session_id)
-    
-    if next_question:
-        # Check if this is an informational question (end of flow)
-        if next_question.get("type") == "informational":
-            question_content = await ask_question(next_question, session.session_id)
-            if isinstance(question_content, InformationalQuestion):
-                question_content.is_completed = True
-                ai_response_content = question_content
-            else:
-                ai_response_content = InformationalQuestion(
-                    question=question_content,
-                    description=next_question.get('description'),
-                    is_completed=True
-                )
-        else:
-            # If there's a user message, process it as an answer
-            if request.message and request.message.strip():
-                # Add user message to database
-                await add_chat_message(session.session_id, "user", request.message)
-                
-                try:
-                    # Process and validate the user's answer to the current question
-                    processed_answer = await process_user_answer(next_question, request.message)
-                    
-                    # Save the user's answer
-                    await save_questionnaire_answer(
-                        session.session_id,
-                        next_question.get("title", ""),
-                        processed_answer,
-                        next_question["partner_questionnaire_question_id"],
-                        next_question.get("type", "")
-                    )
-                    
-                    # Now get the NEXT question after this one
-                    updated_answers = await get_questionnaire_answers_for_session(session.session_id)
-                    next_question_after_answer = await get_next_question_with_rules(questions, updated_answers, session.session_id)
-                    
-                    if next_question_after_answer:
-                        ai_response_content = await ask_question(next_question_after_answer, session.session_id)
-                    else:
-                        ai_response_content = "Great! You've completed all the questions in the questionnaire."
-                    
-                except ValueError as e:
-                    # Handle validation errors
-                    error_message = f"I didn't understand your answer. {str(e)} Please try again."
-                    ai_response_content = error_message
-                    
-                    return ChatResponse(
-                        message=ai_response_content,
-                        session_id=session.session_id,
-                        session_created=session_created
-                    )
-            else:
-                # No user message provided - this is the initial call
-                # Just ask the first question without saving anything
-                ai_response_content = await ask_question(next_question, session.session_id)
-    else:
-        ai_response_content = "Great! You've completed all the questions in the questionnaire."
-
-    # Add AI response to database
-    if isinstance(ai_response_content, (MultipleChoiceQuestion, BooleanQuestion, SingleChoiceQuestion, IntegerQuestion, StringQuestion, TextQuestion, InformationalQuestion)):
-        await add_chat_message(session.session_id, "assistant", ai_response_content.question)
-    else:
-        await add_chat_message(session.session_id, "assistant", ai_response_content)
-    
-    return ChatResponse(
-        message=ai_response_content,
-        session_id=session.session_id,
-        session_created=session_created
-    )
-
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """
@@ -429,46 +45,227 @@ async def chat_endpoint(request: ChatRequest):
         session = await get_or_create_session(request.session_id)
         session_created = request.session_id is None
 
-        # If no questionnaire yet, the user must provide their issue first
-        if session.questionnaire_id is None:
-            # User provided their issue - try to match to a questionnaire
-            try:
-                match_result = await match_questionnaire_to_query(request.message)
-                
-                if match_result and match_result.questionnaire_id:
-                    # Found a matching questionnaire
-                    session.questionnaire_id = match_result.questionnaire_id
-                    await update_session_questionnaire(session.session_id, session.questionnaire_id)
-                    
-                    # Add the user's issue description to chat history
-                    await add_chat_message(session.session_id, "user", request.message)
-                    
-                    # Now proceed with the chat logic, but with an empty message so it asks the first question
-                    # Create a new request object with empty message to avoid processing the issue description as an answer
-                    empty_request = ChatRequest(message="", session_id=request.session_id)
-                    return await handle_chat_logic(session, empty_request, session_created)
-                else:
-                    # No match found - ask for more details
+        # Add user message to chat history
+        if request.message:
+            await add_chat_message(session.session_id, "user", request.message)
+
+        # Use GPT-5 to handle the conversation flow
+        try:
+            # Build conversation context
+            chat_history = await get_chat_messages_from_db(session.session_id)
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": """You are a medical intake assistant that helps patients complete medical forms through natural conversation. Your job is to:
+
+1. Greet patients warmly and understand their complaint
+2. Identify the right medical form/questionnaire for their issue
+3. Ask only the next required question (one at a time, friendly tone)
+4. Normalize answers (yes/no → true/false, "2 days" → 2, dates → ISO)
+5. Spot red flags and stop/escalate when needed
+6. Know when the form is complete and trigger submission
+7. Write a short patient message and concise doctor summary
+
+You have access to these tools:
+- update_session_questionnaire(questionnaire_id): Set the chosen form
+- get_simplified_questionnaires: Get available forms
+- get_simplified_questionnaire(questionnaire_id): Get full form schema
+- save_questionnaire_answer(question_text, answer, question_id, answer_type): Save each answer
+- mark_questionnaire_complete(): Submit the completed form
+
+IMPORTANT: After assigning a questionnaire with update_session_questionnaire(), you should:
+1. Get the questionnaire schema using get_simplified_questionnaire()
+2. Start asking the first question from the questionnaire
+3. Do NOT call update_session_questionnaire() again for the same session
+
+Always be friendly, professional, and prioritize patient safety. If you spot red flags/severe symptoms, pause intake and provide safe next steps."""
+                }
+            ]
+
+            # Add prior chat (user/assistant) to messages
+            for msg in chat_history:
+                messages.append({
+                    "role": "user" if msg["role"] == "user" else "assistant",
+                    "content": msg["content"]
+                })
+
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise Exception("OPENAI_API_KEY not set")
+
+            client = openai.OpenAI(api_key=openai_api_key)
+
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "update_session_questionnaire",
+                        "description": "Set the chosen questionnaire/form for the conversation",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "questionnaire_id": {"type": "string"}
+                            },
+                            "required": ["questionnaire_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_simplified_questionnaires",
+                        "description": "Get a quick catalog of available questionnaires/forms",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_simplified_questionnaire",
+                        "description": "Get the full schema for a specific questionnaire",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "questionnaire_id": {"type": "string"}
+                            },
+                            "required": ["questionnaire_id"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "save_questionnaire_answer",
+                        "description": "Save a patient's answer to a specific question",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question_text": {"type": "string"},
+                                "answer": {"type": "string"},
+                                "question_id": {"type": "string"},
+                                "answer_type": {"type": "string"}
+                            },
+                            "required": ["question_text", "question_id", "answer_type"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mark_questionnaire_complete",
+                        "description": "Mark the questionnaire as complete and submit for doctor review",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ]
+
+            # ===== Core tool-calling loop =====
+            while True:
+                response = client.chat.completions.create(
+                    model="gpt-5",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto"
+                )
+                message = response.choices[0].message
+
+                # Append the assistant message (may contain tool_calls)
+                messages.append({
+                    "role": "assistant",
+                    "content": message.content or "",
+                    **({"tool_calls": message.tool_calls} if getattr(message, "tool_calls", None) else {})
+                })
+
+                tool_calls = getattr(message, "tool_calls", None)
+
+                # If no tool calls, we have the final assistant reply
+                if not tool_calls:
+                    ai_response = message.content or "I'm here to help with your medical intake. How can I assist you today?"
+                    # Persist the final assistant reply to DB
+                    await add_chat_message(session.session_id, "assistant", ai_response)
                     return ChatResponse(
-                        message="I couldn't find a specific questionnaire for your issue. Could you please provide more details about your symptoms or condition?",
+                        message=ai_response,
                         session_id=session.session_id,
                         session_created=session_created
                     )
-                    
-            except Exception as e:
-                print(f"Error matching questionnaire: {str(e)}")
-                return ChatResponse(
-                    message="I'm having trouble understanding your issue. Could you please try describing it differently?",
-                    session_id=session.session_id,
-                    session_created=session_created
-                )
 
-        # Handle the chat logic using the helper function
-        return await handle_chat_logic(session, request, session_created)
+                # Execute each requested tool and append role="tool" results
+                for tool_call in tool_calls:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments or "{}")
+
+                    try:
+                        if function_name == "update_session_questionnaire":
+                            await update_session_questionnaire(session.session_id, function_args["questionnaire_id"])
+                            # keep session updated in memory if your Session model has this attribute
+                            if hasattr(session, "questionnaire_id"):
+                                session.questionnaire_id = function_args["questionnaire_id"]
+                            tool_result = {
+                                "status": "success",
+                                "message": "Questionnaire assigned successfully",
+                                "questionnaire_id": function_args["questionnaire_id"],
+                                "session_id": str(session.session_id)
+                            }
+
+                        elif function_name == "get_simplified_questionnaires":
+                            tool_result = await get_simplified_questionnaires()
+
+                        elif function_name == "get_simplified_questionnaire":
+                            # NOTE: uses questionnaire_id (not question_id)
+                            tool_result = await get_simplified_questionnaire(function_args["questionnaire_id"])
+
+                        elif function_name == "save_questionnaire_answer":
+                            await save_questionnaire_answer(
+                                session.session_id,
+                                function_args["question_text"],
+                                function_args.get("answer"),
+                                function_args["question_id"],
+                                function_args["answer_type"]
+                            )
+                            tool_result = {
+                                "status": "success",
+                                "message": "Answer saved successfully",
+                                "question_id": function_args["question_id"]
+                            }
+
+                        elif function_name == "mark_questionnaire_complete":
+                            await mark_questionnaire_complete(session.session_id)
+                            tool_result = {
+                                "status": "success",
+                                "message": "Questionnaire completed and submitted for doctor review",
+                                "session_id": str(session.session_id),
+                                "completed_at": datetime.utcnow().isoformat()
+                            }
+
+                        else:
+                            tool_result = {"error": f"Unknown tool: {function_name}"}
+
+                    except Exception as e:
+                        tool_result = {"error": f"{function_name} failed: {str(e)}"}
+
+                    # Append the tool result with the matching tool_call_id
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(tool_result)
+                    })
+            # ===== End loop =====
+
+        except Exception as e:
+            print(f"Error in GPT-5 chat: {str(e)}")
+            fallback_response = "I'm having trouble processing your request right now. Please try again or contact support."
+            await add_chat_message(session.session_id, "assistant", fallback_response)
+            return ChatResponse(
+                message=fallback_response,
+                session_id=session.session_id,
+                session_created=session_created
+            )
 
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 
 
 if __name__ == "__main__":

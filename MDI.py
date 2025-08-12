@@ -218,6 +218,141 @@ async def get_questionnaires():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+@router.get("/questionnaires/simplified")
+async def get_simplified_questionnaires():
+    """Get only active questionnaires with just their IDs and names."""
+    access_token = await get_access_token()
+    try:
+        questionnaires = await mdi_request("GET", "questionnaires", access_token=access_token, headers={"Accept": "application/json"})
+        
+        # Filter for active questionnaires and extract only ID and name
+        simplified = []
+        for q in questionnaires:
+            if q.get("active", False):
+                simplified.append({
+                    "id": q.get("partner_questionnaire_id"),
+                    "name": q.get("name", "")
+                })
+        
+        return simplified
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"API Error: {e.response.text}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Request Error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+@router.get("/questionnaires/{questionnaire_id}/simplified")
+async def get_simplified_questionnaire(questionnaire_id: str):
+    """Get a simplified version of a specific questionnaire with only essential fields."""
+    access_token = await get_access_token()
+    try:
+        questionnaire = await mdi_request("GET", f"questionnaires/{questionnaire_id}", access_token=access_token, headers={"Accept": "application/json"})
+        
+        # Extract only the essential fields
+        simplified = {
+            "id": questionnaire.get("partner_questionnaire_id"),
+            "name": questionnaire.get("name", ""),
+            "questions": []
+        }
+        
+        # Process questions with rules
+        if "questions" in questionnaire:
+            for q in questionnaire["questions"]:
+                question_simplified = {
+                    "id": q.get("partner_questionnaire_question_id"),
+                    "title": q.get("title", ""),
+                    "desc": q.get("description", ""),
+                    "order": q.get("order", 0),
+                    "type": q.get("type", ""),
+                    "options": [],
+                    "rules": []
+                }
+                
+                # Process options if they exist
+                if "options" in q:
+                    for opt in q["options"]:
+                        option_simplified = {
+                            "id": opt.get("partner_questionnaire_question_option_id"),
+                            "option": opt.get("option", ""),
+                            "order": opt.get("order", 0)
+                        }
+                        question_simplified["options"].append(option_simplified)
+                
+                # Process rules for this specific question
+                if "rules" in q and q["rules"]:
+                    for rule in q["rules"]:
+                        rule_simplified = {
+                            "rule_id": rule.get("id"),
+                            "rule_type": rule.get("type"),
+                            "requirements": []
+                        }
+                        
+                        # Process rule requirements
+                        if "requirements" in rule:
+                            for req in rule["requirements"]:
+                                requirement_simplified = {
+                                    "based_on": req.get("based_on"),
+                                    "required_question_id": req.get("required_question_id"),
+                                    "required_answer": req.get("required_answer")
+                                }
+                                rule_simplified["requirements"].append(requirement_simplified)
+                        
+                        question_simplified["rules"].append(rule_simplified)
+                
+                simplified["questions"].append(question_simplified)
+        
+        # Add standard medical safety questions to the end
+        standard_questions = [
+            {
+                "id": "standard_allergies",
+                "title": questionnaire.get("allergies_title", "Do you have any drug allergies or intolerances?"),
+                "desc": questionnaire.get("allergies_description"),
+                "order": 1000,
+                "type": "text",
+                "options": [],
+                "rules": []
+            },
+            {
+                "id": "standard_pregnancy",
+                "title": questionnaire.get("pregnancy_title", "Are you pregnant or expecting to be?"),
+                "desc": questionnaire.get("pregnancy_description", "Medications on your treatment plan might not be recommended for pregnant woman."),
+                "order": 1001,
+                "type": "boolean",
+                "options": [],
+                "rules": []
+            },
+            {
+                "id": "standard_medications",
+                "title": questionnaire.get("current_medications_title", "Are you taking any medications?"),
+                "desc": questionnaire.get("current_medications_description", "Many medications have interactions. Your doctor needs to know every medication that you take to help avoid any harmful interactions."),
+                "order": 1002,
+                "type": "text",
+                "options": [],
+                "rules": []
+            },
+            {
+                "id": "standard_conditions",
+                "title": questionnaire.get("medical_conditions_title", "Any medical conditions your doctor should know about?"),
+                "desc": questionnaire.get("medical_conditions_description"),
+                "order": 1003,
+                "type": "text",
+                "options": [],
+                "rules": []
+            }
+        ]
+        
+        # Add the standard questions to the end
+        simplified["questions"].extend(standard_questions)
+        
+        return simplified
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"API Error: {e.response.text}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Request Error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
 @router.get("/questionnaires/{questionnaire_id}")
 async def get_questionnaire(questionnaire_id: str):
     access_token = await get_access_token()
@@ -235,18 +370,6 @@ async def get_questionnaire_questions(questionnaire_id: str):
     access_token = await get_access_token()
     try:
         return await mdi_request("GET", f"questionnaires/{questionnaire_id}/questions", access_token=access_token, headers={"Accept": "application/json"})
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"API Error: {e.response.text}")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Request Error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-@router.get("/questionnaires-with-questions")
-async def get_questionnaires_with_questions():
-    access_token = await get_access_token()
-    try:
-        return await mdi_request("GET", "questionnaires-with-questions", access_token=access_token, headers={"Accept": "application/json"})
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=f"API Error: {e.response.text}")
     except httpx.RequestError as e:
