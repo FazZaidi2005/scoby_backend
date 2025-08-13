@@ -256,6 +256,18 @@ async def get_simplified_questionnaire(questionnaire_id: str):
             "questions": []
         }
         
+        # Add sex question at the very beginning
+        sex_question = {
+            "id": "standard_sex",
+            "title": "What is your biological sex?",
+            "desc": "This helps us provide appropriate medical care and medication recommendations.",
+            "order": 1,
+            "type": "boolean",
+            "options": [],
+            "rules": []
+        }
+        simplified["questions"].append(sex_question)
+        
         # Process questions with rules
         if "questions" in questionnaire:
             for q in questionnaire["questions"]:
@@ -306,8 +318,8 @@ async def get_simplified_questionnaire(questionnaire_id: str):
         standard_questions = [
             {
                 "id": "standard_allergies",
-                "title": questionnaire.get("allergies_title", "Do you have any drug allergies or intolerances?"),
-                "desc": questionnaire.get("allergies_description"),
+                "title": "Do you have any drug allergies or intolerances?",
+                "desc": None,
                 "order": 1000,
                 "type": "text",
                 "options": [],
@@ -315,17 +327,29 @@ async def get_simplified_questionnaire(questionnaire_id: str):
             },
             {
                 "id": "standard_pregnancy",
-                "title": questionnaire.get("pregnancy_title", "Are you pregnant or expecting to be?"),
-                "desc": questionnaire.get("pregnancy_description", "Medications on your treatment plan might not be recommended for pregnant woman."),
+                "title": "Are you pregnant or expecting to be?",
+                "desc": "Medications on your treatment plan might not be recommended for pregnant women.",
                 "order": 1001,
                 "type": "boolean",
                 "options": [],
-                "rules": []
+                "rules": [
+                    {
+                        "rule_id": "pregnancy_rule",
+                        "rule_type": "and",
+                        "requirements": [
+                            {
+                                "based_on": "question",
+                                "required_question_id": "standard_sex",
+                                "required_answer": "0"  # Only show for females (0 = female, 1 = male)
+                            }
+                        ]
+                    }
+                ]
             },
             {
                 "id": "standard_medications",
-                "title": questionnaire.get("current_medications_title", "Are you taking any medications?"),
-                "desc": questionnaire.get("current_medications_description", "Many medications have interactions. Your doctor needs to know every medication that you take to help avoid any harmful interactions."),
+                "title": "Are you taking any medications?",
+                "desc": "Many medications have interactions. Your doctor needs to know every medication that you take to help avoid any harmful interactions.",
                 "order": 1002,
                 "type": "text",
                 "options": [],
@@ -333,8 +357,8 @@ async def get_simplified_questionnaire(questionnaire_id: str):
             },
             {
                 "id": "standard_conditions",
-                "title": questionnaire.get("medical_conditions_title", "Any medical conditions your doctor should know about?"),
-                "desc": questionnaire.get("medical_conditions_description"),
+                "title": "Any medical conditions your doctor should know about?",
+                "desc": None,
                 "order": 1003,
                 "type": "text",
                 "options": [],
